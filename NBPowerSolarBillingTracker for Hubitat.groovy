@@ -39,9 +39,8 @@ definition(
                  "current NB Power net metering against the proposed rate structure.",
     category:    "Energy Management",
     iconUrl:     "",
-    iconX2Url:   ""
-    importUrl:   "https://raw.githubusercontent.com/SebastienViel/NB-Power-Rates/main/NBPowerSolarBillingTracker%20for%20Hubitat.groovy",
-
+    iconX2Url:   "",
+    importUrl:   "https://raw.githubusercontent.com/SebastienViel/NB-Power-Rates/main/NBPowerSolarBillingTracker%20for%20Hubitat.groovy"
 )
 
 // ---------------------------------------------------------------------------

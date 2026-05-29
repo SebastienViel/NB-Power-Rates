@@ -40,6 +40,8 @@ definition(
     category:    "Energy Management",
     iconUrl:     "",
     iconX2Url:   ""
+    importUrl:   "https://raw.githubusercontent.com/SebastienViel/NB-Power-Rates/main/NBPowerSolarBillingTracker%20for%20Hubitat.groovy",
+
 )
 
 // ---------------------------------------------------------------------------

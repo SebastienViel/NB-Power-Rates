@@ -1,31 +1,47 @@
 /**
- *  NB Power Solar Billing Tracker  v1.1
+ *  NB Power Solar Billing Tracker  v1.4
  *
- *  Monitors Emporia Vue power data to compare the current NB Power net metering
- *  rate structure against the proposed three-part rate (import rate + export credit
+ *  Monitors energy data to compare the current NB Power net metering rate
+ *  structure against the proposed three-part rate (import rate + export credit
  *  + demand charge), pending EUB approval April 1, 2027.
  *
- *  Requires: Emporia Vue devices exposing the PowerMeter capability (watts).
- *            Compatible with amithalp/EmporiaV2 and ke7lvb/Emporia-Vue-Hubitat.
+ *  Supports two device modes (selected in preferences):
  *
- *  v1.1 changes:
- *    - All device inputs now use capability.powerMeter (watts) only.
- *      No energyMeter (kWh) capability required.
- *    - Removed snapshot/manual accumulation mode choice — always integrates
- *      watts × time internally (one reading per minute = 1/60 kWh per kW).
- *    - Separate "peak power device" input removed; the grid import device
- *      is used for both kWh accumulation and demand tracking.
- *    - Watt values from Emporia are directional:
- *        gridImportDevice  → positive watts = consuming from grid
- *        solarExportDevice → positive watts = sending power to grid
- *      The app treats each as unsigned (absolute value) and accumulates
- *      them independently, so negative readings are safely ignored.
+ *  MODE A — PowerMeter (watts), e.g. Emporia Vue via amithalp/EmporiaV2
+ *    - Two devices: "mains from grid" and "mains to grid", both PowerMeter
+ *    - App polls watts every minute and integrates to kWh internally
+ *    - Also builds a 15-min rolling average for peak demand tracking
  *
- *  Billing math:
+ *  MODE B — EnergyMeter (kWh, never-resetting), e.g. Anotech or similar
+ *    - Two devices: grid consumption total (kWh) and solar production total (kWh)
+ *    - Both counters are monotonically increasing and never reset
+ *    - App snapshots each counter at billing period start, computes delta
+ *    - For peak demand, a separate PowerMeter device can optionally be added;
+ *      without it, demand charge is estimated from the per-minute kWh delta
+ *
+ *  In both modes the billing formulas are identical:
  *    Current net metering : (importKwh − exportKwh) × currentRate
  *    Proposed structure   : (importKwh × importRate)
  *                         − (exportKwh × exportRate)
  *                         + (peakKw    × demandCharge)
+ *
+ *  v1.4 changes:
+    - Added Refresh Display button to manually update the status paragraph.
+
+  v1.3 changes:
+ *    - Added MODE B: EnergyMeter (never-resetting kWh) device support
+ *    - Device mode selector in preferences switches UI and calculation path
+ *    - Peak demand in MODE B works from optional PowerMeter or estimated from kWh delta
+ *    - Demand window (7 am–10 pm) enforced in both modes
+ *    - All existing MODE A (PowerMeter/Emporia) behaviour preserved unchanged
+ *
+ *  v1.2 changes:
+ *    - Added importUrl to definition block for one-click Hubitat import.
+ *
+ *  v1.1 changes:
+ *    - All device inputs use capability.powerMeter (watts) only.
+ *    - Removed snapshot/manual accumulation mode choice.
+ *    - Separate peak power device input removed.
  *
  *  Author : generated for Sébastien with Claude (Anthropic), May 2026
  *  License: Apache 2.0
@@ -36,7 +52,8 @@ definition(
     namespace:   "nbpower",
     author:      "Sébastien",
     description: "Tracks solar import/export kWh and 15-min peak demand to compare " +
-                 "current NB Power net metering against the proposed rate structure.",
+                 "current NB Power net metering against the proposed rate structure. " +
+                 "Supports Emporia Vue (watts) and Anotech-style (never-resetting kWh) devices.",
     category:    "Energy Management",
     iconUrl:     "",
     iconX2Url:   "",
@@ -73,16 +90,16 @@ def mainPage() {
             input "summaryDevice", "capability.actuator",
                 title: "Optional: Virtual device to write summary tile attributes to",
                 required: false, multiple: false
-            paragraph "If set, attributes <i>nbpImportKwh</i>, <i>nbpExportKwh</i>, " +
-                      "<i>nbpPeakKw</i>, <i>nbpCurrentCost</i>, <i>nbpProposedCost</i>, " +
-                      "<i>nbpDelta</i>, <i>nbpPeakKwTime</i>, <i>nbpBillingStart</i> " +
-                      "are written every minute for use in Hubitat dashboards."
+            paragraph "Attributes written every minute: <i>nbpImportKwh, nbpExportKwh, " +
+                      "nbpPeakKw, nbpCurrentCost, nbpProposedCost, nbpDelta, " +
+                      "nbpPeakKwTime, nbpBillingStart</i>"
         }
 
         section("<b>Billing Period Controls</b>") {
-            input "resetBtn", "button", title: "🔄 Reset Billing Period Now"
-            paragraph "Use this at the start of each new billing cycle to zero all counters. " +
-                      "The app also resets automatically on the configured billing day."
+            input "refreshBtn", "button", title: "🔃 Refresh Display"
+            input "resetBtn",   "button", title: "🔄 Reset Billing Period Now"
+            paragraph "Refresh updates the status below from current device readings. " +
+                      "Reset zeroes all counters and starts a new billing period."
             paragraph billingStatusParagraph()
         }
 
@@ -95,34 +112,84 @@ def mainPage() {
 def devicesPage() {
     dynamicPage(name: "devicesPage", title: "Energy Devices", nextPage: "mainPage") {
 
-        section("<b>Select Emporia Vue channels</b>") {
-            paragraph """The Emporia Vue integration creates one child device per circuit, 
-each exposing a <i>power</i> attribute in watts. Select the two mains channels below.
-
-<b>Important:</b> Emporia reports the mains-to-grid (solar export) channel as a 
-positive watt value when power is flowing to the grid. Both channels are treated 
-as unsigned here — the app accumulates them independently."""
-
-            input "gridImportDevice", "capability.powerMeter",
-                title: "Mains FROM grid — energy consumed from the grid (watts)",
-                description: "Your 'mains from grid' or grid import CT channel",
-                required: true, multiple: false
-
-            input "solarExportDevice", "capability.powerMeter",
-                title: "Mains TO grid — energy sent to the grid / solar export (watts)",
-                description: "Your 'mains to grid' or solar export CT channel",
-                required: true, multiple: false
+        section("<b>Device Mode</b>") {
+            input "deviceMode", "enum",
+                title: "Select your meter type",
+                options: [
+                    "watts": "MODE A — PowerMeter / watts (e.g. Emporia Vue)",
+                    "kwh":   "MODE B — EnergyMeter / never-resetting kWh (e.g. Anotech)"
+                ],
+                defaultValue: "watts", required: true, submitOnChange: true
         }
 
-        section("<b>How kWh is calculated</b>") {
-            paragraph """The app polls both devices every minute. Each reading (in watts) 
-is divided by 1000 to get kW, then divided by 60 to convert one minute of power 
-into kWh (kW × 1/60 h). These increments are summed into running totals for 
-the billing period.
+        // ── MODE A: PowerMeter (watts) ──────────────────────────────────
+        if (!deviceMode || deviceMode == "watts") {
+            section("<b>MODE A — PowerMeter devices (watts)</b>") {
+                paragraph """The Emporia Vue integration exposes a <i>power</i> attribute 
+in watts for each circuit. Select the two mains channels.
+Both are treated as unsigned — negative readings are safely ignored."""
 
-For the peak demand calculation, the last 15 one-minute readings from the 
-grid import device are averaged to produce a 15-minute average kW value. 
-Only readings taken between the configured demand window hours are considered."""
+                input "gridImportDevice", "capability.powerMeter",
+                    title: "Mains FROM grid — watts consumed from the utility",
+                    description: "Your 'mains from grid' or grid import CT channel",
+                    required: true, multiple: false
+
+                input "solarExportDevice", "capability.powerMeter",
+                    title: "Mains TO grid — watts your solar sends to the grid",
+                    description: "Your 'mains to grid' or solar export CT channel",
+                    required: true, multiple: false
+            }
+
+            section("<b>How it works in MODE A</b>") {
+                paragraph """The app polls both devices every minute. Watts are converted 
+to kWh (watts ÷ 1000 ÷ 60) and added to running totals. The grid import 
+device also feeds a 15-minute rolling average for peak demand tracking."""
+            }
+        }
+
+        // ── MODE B: EnergyMeter (never-resetting kWh) ──────────────────
+        if (deviceMode == "kwh") {
+            section("<b>MODE B — EnergyMeter devices (never-resetting kWh)</b>") {
+                paragraph """These devices expose an <i>energy</i> attribute that increases 
+monotonically and never resets. The app records a baseline at the start 
+of each billing period and computes usage as <b>current − baseline</b>.
+
+The solar device should represent total solar production or total energy 
+sent to the grid — whichever your meter tracks."""
+
+                input "gridKwhDevice", "capability.energyMeter",
+                    title: "Grid consumption — total kWh drawn from NB Power (never resets)",
+                    description: "e.g. Anotech mains import channel",
+                    required: true, multiple: false
+
+                input "solarKwhDevice", "capability.energyMeter",
+                    title: "Solar / export — total kWh sent to grid or solar production (never resets)",
+                    description: "e.g. Anotech solar or export channel",
+                    required: true, multiple: false
+            }
+
+            section("<b>Peak demand in MODE B</b>") {
+                paragraph """Peak demand tracking requires instantaneous power (watts). 
+Options:
+• If you have <i>any</i> PowerMeter device that shows whole-home grid draw, 
+  select it below and the app will use it for 15-min demand tracking.
+• If you leave it blank, the app estimates demand from the per-minute 
+  kWh delta (less precise but functional). The demand charge will still 
+  be calculated — it may be slightly conservative."""
+
+                input "peakWattsDevice", "capability.powerMeter",
+                    title: "Optional: PowerMeter device for peak demand tracking (watts)",
+                    description: "Leave blank to estimate from kWh delta",
+                    required: false, multiple: false
+            }
+
+            section("<b>How it works in MODE B</b>") {
+                paragraph """At billing period start (or on first run), the app snapshots 
+both kWh counters. Every minute it reads both current values and computes:
+  importKwh = current grid kWh − baseline grid kWh
+  exportKwh = current solar kWh − baseline solar kWh
+These are used directly in the billing formulas."""
+            }
         }
     }
 }
@@ -153,7 +220,7 @@ def ratesPage() {
         section("<b>Demand charge window</b>") {
             paragraph "NB Power's proposal applies the demand charge only between <b>7:00 am and 10:00 pm</b>."
             input "demandWindowStart", "number",
-                title: "Window start hour (0–23, default 7 = 7:00 am)",
+                title: "Window start hour (0–23, default 7)",
                 defaultValue: 7, range: "0..23", required: true
             input "demandWindowEnd", "number",
                 title: "Window end hour (0–23, default 22 = 10:00 pm)",
@@ -165,20 +232,19 @@ def ratesPage() {
 def notificationsPage() {
     dynamicPage(name: "notificationsPage", title: "Notifications", nextPage: "mainPage") {
         section("<b>Demand spike alert</b>") {
-            paragraph "Send a notification when the current grid import power exceeds a threshold."
+            paragraph "Sends a notification when instantaneous grid draw exceeds a threshold."
             input "notifyDevices", "capability.notification",
                 title: "Notification devices", required: false, multiple: true
             input "spikeThresholdKw", "decimal",
-                title: "Alert when grid import exceeds (kW) — set 0 to disable",
+                title: "Alert when grid draw exceeds (kW) — set 0 to disable",
                 defaultValue: 0, range: "0..100", required: false
             input "spikeAlertCooldownMin", "number",
                 title: "Minimum minutes between spike alerts",
                 defaultValue: 30, range: "1..1440", required: false
         }
-
         section("<b>Monthly summary notification</b>") {
             input "sendMonthlySummary", "bool",
-                title: "Send billing summary notification at start of each new period",
+                title: "Send billing summary at start of each new period",
                 defaultValue: true
         }
     }
@@ -202,13 +268,14 @@ def updated() {
 def initialize() {
     if (state.billingStart == null) resetBillingPeriod()
 
-    // Poll every minute for watts readings
+    // Poll every minute
     schedule("0 * * * * ?", "everyMinute")
 
-    // Auto-reset at midnight on the billing day each month
+    // Auto-reset at midnight on the billing day
     schedule("0 0 0 ${billingDay} * ?", "autoBillingReset")
 
-    logInfo "Initialised. Billing period: ${currentBillingPeriodLabel()}"
+    logInfo "Initialised in MODE ${deviceMode?.toUpperCase() ?: 'A (watts)'}. " +
+            "Billing period: ${currentBillingPeriodLabel()}"
     refreshSummary()
 }
 
@@ -216,7 +283,10 @@ def initialize() {
 // Button handler
 // ---------------------------------------------------------------------------
 def appButtonHandler(btn) {
-    if (btn == "resetBtn") {
+    if (btn == "refreshBtn") {
+        logDebug "Manual display refresh."
+        refreshSummary()
+    } else if (btn == "resetBtn") {
         logInfo "Manual billing period reset."
         endOfPeriodSummary()
         resetBillingPeriod()
@@ -235,53 +305,92 @@ def autoBillingReset() {
 }
 
 def resetBillingPeriod() {
-    def now = now()
-    state.billingStart    = now
-    state.billingStartStr = formatDate(now)
+    def ts = now()
+    state.billingStart    = ts
+    state.billingStartStr = formatDate(ts)
 
-    // kWh running totals (accumulated from watts × time)
-    state.importKwh       = 0.0
-    state.exportKwh       = 0.0
+    // MODE A — watts integration totals
+    state.importKwhManual = 0.0
+    state.exportKwhManual = 0.0
 
-    // 15-minute demand tracking
-    // minuteWatts: ring buffer of the last 15 one-minute import watt readings
-    state.minuteWatts     = []
+    // MODE B — never-resetting kWh baselines (snapshot at reset time)
+    state.importKwhBase   = safeEnergy(gridKwhDevice)
+    state.exportKwhBase   = safeEnergy(solarKwhDevice)
+
+    // Peak demand — shared by both modes
+    state.minuteWatts     = []    // rolling 15-sample buffer
     state.peakKw          = 0.0
     state.peakKwTime      = ""
 
     // Spike alert cooldown
-    state.lastSpikeAlert  = 0
+    state.lastSpikeAlert  = 0L
 
-    logInfo "Billing period reset at ${state.billingStartStr}."
+    logInfo "Billing period reset at ${state.billingStartStr}." +
+            (deviceMode == "kwh" ?
+                " Grid baseline: ${state.importKwhBase} kWh, Solar baseline: ${state.exportKwhBase} kWh." :
+                " Watt-integration counters zeroed.")
 }
 
 // ---------------------------------------------------------------------------
-// Every-minute handler — heart of the app
+// Every-minute handler
 // ---------------------------------------------------------------------------
 def everyMinute() {
-    // Read current watts from each device (treat both as unsigned/positive)
-    def importW = Math.max(0.0, safeWatts(gridImportDevice))
-    def exportW = Math.max(0.0, safeWatts(solarExportDevice))
+    if (deviceMode == "kwh") {
+        everyMinuteKwh()
+    } else {
+        everyMinuteWatts()
+    }
+    refreshSummary()
+}
 
-    // ── kWh accumulation ──────────────────────────────────────────────────
-    // 1 minute at importW watts = importW/1000 kW × (1/60) h
-    state.importKwh = ((state.importKwh ?: 0.0) + (importW / 1000.0 / 60.0))
-    state.exportKwh = ((state.exportKwh ?: 0.0) + (exportW / 1000.0 / 60.0))
+// ── MODE A: watts ──────────────────────────────────────────────────────────
+def everyMinuteWatts() {
+    double importW = Math.max(0.0, safeWatts(gridImportDevice))
+    double exportW = Math.max(0.0, safeWatts(solarExportDevice))
 
-    // ── 15-minute rolling demand window ───────────────────────────────────
-    def hr = Calendar.getInstance(location.timeZone).get(Calendar.HOUR_OF_DAY)
-    def winStart = (demandWindowStart ?: 7) as int
-    def winEnd   = (demandWindowEnd   ?: 22) as int
+    // Integrate to kWh: 1 min at W watts = W/1000/60 kWh
+    state.importKwhManual = (state.importKwhManual ?: 0.0) + (importW / 1000.0 / 60.0)
+    state.exportKwhManual = (state.exportKwhManual ?: 0.0) + (exportW / 1000.0 / 60.0)
+
+    trackDemand(importW)
+    checkSpikeAlert(importW)
+}
+
+// ── MODE B: never-resetting kWh ───────────────────────────────────────────
+def everyMinuteKwh() {
+    // kWh values come straight from the energy attribute delta — no integration needed.
+    // Demand tracking: use dedicated PowerMeter if configured, otherwise estimate
+    // from the per-minute import kWh delta (delta kWh × 60 = average kW that minute).
+    double wattsForDemand
+    if (peakWattsDevice) {
+        wattsForDemand = Math.max(0.0, safeWatts(peakWattsDevice))
+    } else {
+        // Estimate: how many kWh arrived in the last minute × 60 min/h × 1000 W/kW
+        double prevImport = (state.prevImportKwh ?: safeEnergy(gridKwhDevice)) as double
+        double curImport  = safeEnergy(gridKwhDevice)
+        double deltaKwh   = Math.max(0.0, curImport - prevImport)
+        wattsForDemand    = deltaKwh * 60.0 * 1000.0
+        state.prevImportKwh = curImport
+    }
+
+    trackDemand(wattsForDemand)
+    checkSpikeAlert(wattsForDemand)
+}
+
+// ── Shared demand tracking ─────────────────────────────────────────────────
+void trackDemand(double wattsNow) {
+    int hr       = Calendar.getInstance(location.timeZone).get(Calendar.HOUR_OF_DAY)
+    int winStart = (demandWindowStart ?: 7) as int
+    int winEnd   = (demandWindowEnd   ?: 22) as int
 
     if (hr >= winStart && hr < winEnd) {
         List buf = state.minuteWatts ?: []
-        buf << importW
-        // Keep only the last 15 samples (one per minute = 15-minute window)
+        buf << wattsNow
         if (buf.size() > 15) buf = buf.drop(buf.size() - 15)
         state.minuteWatts = buf
 
         if (buf.size() == 15) {
-            def avgKw = (buf.sum() / 15.0) / 1000.0
+            double avgKw = (buf.sum() / 15.0) / 1000.0
             if (avgKw > (state.peakKw ?: 0.0)) {
                 state.peakKw     = avgKw.round(4)
                 state.peakKwTime = formatDate(now())
@@ -289,53 +398,68 @@ def everyMinute() {
             }
         }
     } else {
-        // Outside the demand window — clear the buffer so it doesn't straddle the boundary
-        state.minuteWatts = []
+        state.minuteWatts = []   // clear buffer outside demand window
     }
+}
 
-    // ── Spike alert ───────────────────────────────────────────────────────
-    def threshKw = (spikeThresholdKw ?: 0) as double
-    if (threshKw > 0 && (importW / 1000.0) > threshKw) {
-        def cooldownMs = ((spikeAlertCooldownMin ?: 30) * 60 * 1000) as long
-        if ((now() - (state.lastSpikeAlert ?: 0L)) > cooldownMs) {
-            state.lastSpikeAlert = now()
-            def kw      = (importW / 1000.0).round(2)
-            def impact  = (kw * (demandChargeRate ?: 13.0)).round(2)
-            sendNotifications(
-                "⚡ Demand spike: grid import is ${kw} kW " +
-                "(threshold ${threshKw} kW). " +
-                "If sustained 15 min, demand charge impact: \$${impact}."
-            )
-        }
+// ── Spike alert ────────────────────────────────────────────────────────────
+void checkSpikeAlert(double wattsNow) {
+    double threshKw = (spikeThresholdKw ?: 0) as double
+    if (threshKw <= 0) return
+    if ((wattsNow / 1000.0) <= threshKw) return
+
+    long cooldownMs = ((spikeAlertCooldownMin ?: 30) * 60 * 1000) as long
+    if ((now() - (state.lastSpikeAlert ?: 0L)) > cooldownMs) {
+        state.lastSpikeAlert = now()
+        double kw     = (wattsNow / 1000.0).round(2)
+        double impact = (kw * (demandChargeRate ?: 13.0)).round(2)
+        sendNotifications(
+            "⚡ Demand spike: grid draw is ${kw} kW " +
+            "(threshold ${threshKw} kW). " +
+            "If sustained 15 min, demand charge impact: \$${impact}."
+        )
     }
-
-    refreshSummary()
 }
 
 // ---------------------------------------------------------------------------
-// Core calculations
+// Core calculations — same formulas regardless of mode
 // ---------------------------------------------------------------------------
-double importKwh()   { return (state.importKwh ?: 0.0) as double }
-double exportKwh()   { return (state.exportKwh ?: 0.0) as double }
-double peakKw()      { return (state.peakKw    ?: 0.0) as double }
+double importKwh() {
+    if (deviceMode == "kwh") {
+        double cur  = safeEnergy(gridKwhDevice)
+        double base = (state.importKwhBase ?: 0.0) as double
+        return Math.max(0.0, cur - base)
+    }
+    return (state.importKwhManual ?: 0.0) as double
+}
+
+double exportKwh() {
+    if (deviceMode == "kwh") {
+        double cur  = safeEnergy(solarKwhDevice)
+        double base = (state.exportKwhBase ?: 0.0) as double
+        return Math.max(0.0, cur - base)
+    }
+    return (state.exportKwhManual ?: 0.0) as double
+}
+
+double peakKw()      { return (state.peakKw ?: 0.0) as double }
 
 double currentCost() {
-    // Positive result = amount owed; negative = credit to carry forward
     double netKwh = importKwh() - exportKwh()
     return (netKwh * ((currentNetRate ?: 14.76) / 100.0)).round(2)
 }
 
 double proposedCost() {
-    double importCost   = importKwh() * ((proposedImportRate ?: 14.76) / 100.0)
-    double exportCredit = exportKwh() * ((proposedExportRate ?: 6.77)  / 100.0)
-    double demandCost   = peakKw()    *  (demandChargeRate   ?: 13.00)
+    double importCost    = importKwh() * ((proposedImportRate ?: 14.76) / 100.0)
+    double exportCredit  = exportKwh() * ((proposedExportRate ?: 6.77)  / 100.0)
+    double demandCost    = peakKw()    *  (demandChargeRate   ?: 13.00)
     return (importCost - exportCredit + demandCost).round(2)
 }
 
 double delta() { return (proposedCost() - currentCost()).round(2) }
 
 // ---------------------------------------------------------------------------
-// Summary helpers
+// Summary / dashboard
 // ---------------------------------------------------------------------------
 def refreshSummary() {
     double imp  = importKwh().round(2)
@@ -346,16 +470,17 @@ def refreshSummary() {
     double delt = delta()
     String sign = delt >= 0 ? "+" : ""
 
-    logDebug "Summary — Import: ${imp} kWh | Export: ${exp} kWh | Peak: ${peak} kW | " +
+    logDebug "Summary [MODE ${deviceMode?.toUpperCase()}] — " +
+             "Import: ${imp} kWh | Export: ${exp} kWh | Peak: ${peak} kW | " +
              "Current: \$${cur} | Proposed: \$${prop} | Δ: ${sign}\$${delt}"
 
     if (summaryDevice) {
-        sendEvent(summaryDevice, [name: "nbpImportKwh",    value: imp,                  unit: "kWh"])
-        sendEvent(summaryDevice, [name: "nbpExportKwh",    value: exp,                  unit: "kWh"])
-        sendEvent(summaryDevice, [name: "nbpPeakKw",       value: peak,                 unit: "kW"])
-        sendEvent(summaryDevice, [name: "nbpCurrentCost",  value: cur,                  unit: "\$"])
-        sendEvent(summaryDevice, [name: "nbpProposedCost", value: prop,                 unit: "\$"])
-        sendEvent(summaryDevice, [name: "nbpDelta",        value: "${sign}${delt}",     unit: "\$"])
+        sendEvent(summaryDevice, [name: "nbpImportKwh",    value: imp,              unit: "kWh"])
+        sendEvent(summaryDevice, [name: "nbpExportKwh",    value: exp,              unit: "kWh"])
+        sendEvent(summaryDevice, [name: "nbpPeakKw",       value: peak,             unit: "kW"])
+        sendEvent(summaryDevice, [name: "nbpCurrentCost",  value: cur,              unit: "\$"])
+        sendEvent(summaryDevice, [name: "nbpProposedCost", value: prop,             unit: "\$"])
+        sendEvent(summaryDevice, [name: "nbpDelta",        value: "${sign}${delt}", unit: "\$"])
         sendEvent(summaryDevice, [name: "nbpPeakKwTime",   value: state.peakKwTime ?: "—"])
         sendEvent(summaryDevice, [name: "nbpBillingStart", value: state.billingStartStr ?: "—"])
     }
@@ -370,12 +495,16 @@ def endOfPeriodSummary() {
     double delt = delta()
     String sign = delt >= 0 ? "+" : ""
 
-    double importLineCost  = (imp  * (proposedImportRate ?: 14.76) / 100.0).round(2)
-    double exportLineCost  = (exp  * (proposedExportRate ?: 6.77)  / 100.0).round(2)
-    double demandLineCost  = (peak * (demandChargeRate   ?: 13.00)).round(2)
+    double importLineCost = (imp  * (proposedImportRate ?: 14.76) / 100.0).round(2)
+    double exportLineCost = (exp  * (proposedExportRate ?: 6.77)  / 100.0).round(2)
+    double demandLineCost = (peak * (demandChargeRate   ?: 13.00)).round(2)
+
+    def modeLabel = deviceMode == "kwh" ?
+        "EnergyMeter / never-resetting kWh" : "PowerMeter / watts (Emporia)"
 
     def msg = """\
 📊 NB Power Billing Period Summary
+Mode   : ${modeLabel}
 Period : ${state.billingStartStr} – ${formatDate(now())}
 ─────────────────────────────────────
 Grid import  : ${imp} kWh
@@ -409,7 +538,17 @@ double safeWatts(dev) {
     }
 }
 
-def sendNotifications(String msg) {
+double safeEnergy(dev) {
+    try {
+        def v = dev?.currentValue("energy")
+        return (v != null) ? (v as double) : 0.0
+    } catch (e) {
+        logDebug "safeEnergy error for ${dev?.displayName}: ${e.message}"
+        return 0.0
+    }
+}
+
+void sendNotifications(String msg) {
     notifyDevices?.each { it.deviceNotification(msg) }
 }
 
@@ -418,11 +557,11 @@ String formatDate(long ts) {
 }
 
 String currentBillingPeriodLabel() {
-    def now  = new Date()
-    int day  = now.date
-    int yr   = now.year + 1900
-    int mo   = now.month   // 0-based
-    int bd   = (billingDay ?: 1) as int
+    def now = new Date()
+    int day = now.date
+    int yr  = now.year + 1900
+    int mo  = now.month
+    int bd  = (billingDay ?: 1) as int
 
     Date start
     if (day >= bd) {
@@ -443,8 +582,10 @@ String billingStatusParagraph() {
     double prop = proposedCost()
     double delt = delta()
     String sign = delt >= 0 ? "+" : ""
+    String mode = deviceMode == "kwh" ? "MODE B (kWh)" : "MODE A (watts)"
 
-    return "<b>Period started:</b> ${state.billingStartStr ?: '(not set)'}" +
+    return "<b>Mode:</b> ${mode}" +
+           "<br><b>Period started:</b> ${state.billingStartStr ?: '(not set)'}" +
            "<br><b>Import:</b> ${imp} kWh &nbsp; <b>Export:</b> ${exp} kWh" +
            "<br><b>Peak 15-min demand:</b> ${peak} kW (at ${state.peakKwTime ?: '—'})" +
            "<br><b>Current net metering cost:</b> \$${cur}" +
@@ -452,8 +593,13 @@ String billingStatusParagraph() {
 }
 
 String devicesDescription() {
-    if (!gridImportDevice || !solarExportDevice) return "Tap to configure ←"
-    return "From grid: ${gridImportDevice.displayName}\nTo grid: ${solarExportDevice.displayName}"
+    if (deviceMode == "kwh") {
+        if (!gridKwhDevice || !solarKwhDevice) return "Tap to configure (MODE B — kWh) ←"
+        return "MODE B | Grid: ${gridKwhDevice.displayName}\nSolar: ${solarKwhDevice.displayName}" +
+               (peakWattsDevice ? "\nPeak meter: ${peakWattsDevice.displayName}" : "\nPeak: estimated from kWh delta")
+    }
+    if (!gridImportDevice || !solarExportDevice) return "Tap to configure (MODE A — watts) ←"
+    return "MODE A | From grid: ${gridImportDevice.displayName}\nTo grid: ${solarExportDevice.displayName}"
 }
 
 String ratesDescription() {
